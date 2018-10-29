@@ -1,0 +1,187 @@
+#!/usr/bin/env ruby
+require_relative '../aws-ops/lib/codepipeline'
+require_relative '../aws-ops/lib/iam'
+require_relative '../aws-ops/lib/log.rb'
+require 'logger'
+require 'json'
+require 'yaml'
+
+# TODO:
+# 1) add git token to secret manager
+# 2) create AWS Code Build project using AWS Ruby SDK
+# 3) find a way to update the pipeline
+
+def init_logger
+  l          = Logger.new(STDOUT)
+  l.level    = Logger::INFO
+  Log.logger = l
+end
+
+class CreatePipeline
+  attr_accessor :repo_name, :pipeline_id, :owners
+
+  def initialize(pipeline_yaml)
+    read_pipeline_info(pipeline_yaml)
+  end
+
+  def read_pipeline_info(pipeline_yaml)
+    Log.info("reading pipeline info")
+    info         = YAML.load_file(pipeline_yaml)
+    @repo_name   = info["Name"]
+    @pipeline_id = info["Id"]
+    @owners      ||= info["Owners"]
+  end
+
+  def create
+    pipeline = PipelineBuilder.build do |builder|
+      builder.name("#{@repo_name}Pipeline")
+          .role("#{pipeline_iam_role_arn}")
+          .artifact_store("#{pipeline_s3_location}")
+          .stage(source)
+          .stage(approval)
+          .stage(build)
+    end
+    Log.info("creating #{@repo_name}Pipeline")
+    pipeline.create
+    # puts JSON.pretty_generate(pipeline.config)
+  end
+
+  def source
+    sourceAction = Action.new()
+                       .name("Source")
+                       .action_type(ActionTypeId.Source)
+                       .run_order(1)
+                       .output_artifact("#{@repo_name}SourceOutputArtifact")
+                       .add_configuration("Owner", "tkashish")
+                       .add_configuration("Repo", "#{@repo_name}")
+                       .add_configuration("Branch", "master")
+                       .add_configuration("OAuthToken", "#{git_token}")
+    source       = Stage.new("Source").action(sourceAction)
+  end
+
+  def build
+    buildAction = Action.new()
+                      .name("Build")
+                      .action_type(ActionTypeId.Build)
+                      .run_order(1)
+                      .input_artifact("#{@repo_name}SourceOutputArtifact")
+                      .output_artifact("#{@repo_name}BuildOutputArtifact")
+                      .add_configuration("ProjectName", "#{build_project_name}")
+    build       = Stage.new("Build").action(buildAction)
+  end
+
+  def approval
+    approvalActionTypeId = ActionTypeId.new()
+                               .category("Approval")
+                               .owner("AWS")
+                               .version("1")
+                               .provider("Manual")
+    approvalAction       = Action.new()
+                               .name("ManualApproval")
+                               .action_type(approvalActionTypeId.params)
+                               .run_order(1)
+                               .add_configuration("NotificationArn", "#{create_pipeline_sns_topic}")
+    manualApproval       = Stage.new("Approval").action(approvalAction)
+  end
+
+  def create_pipeline_sns_topic()
+    Log.info("creating sns topic for #{@repo_name}Pipeline")
+    sns  = Aws::SNS::Client.new()
+    resp = sns.create_topic({
+                                name: "#{@repo_name}PipelineSnsTopic", # required
+                            })
+    @owners.each do |owner|
+      Log.info("adding subscriber #{owner}")
+      sns.subscribe({
+                        topic_arn:               resp.topic_arn,
+                        protocol:                "email",
+                        endpoint:                "#{owner}",
+                        return_subscription_arn: false,
+                    })
+    end
+    Log.info("Check your email and please confirm the subscription.".green)
+    return resp.topic_arn
+  end
+
+  def git_token
+    ""
+  end
+
+  def build_project_name
+    "test-code-build"
+  end
+
+  def pipeline_iam_role_arn
+    Log.info("creating iam policy #{@repo_name}PipelinePolicy for pipeline")
+    statement   = PolicyStatement.new()
+                      .effect("Allow")
+                      .action(pipeline_role_policies)
+                      .resource("*")
+    policy_resp = Policy.new()
+                      .name("#{@repo_name}PipelinePolicy")
+                      .statement(statement)
+                      .create
+    role_name   = "#{@repo_name}PipelineRole"
+    Log.info("creating iam role #{role_name} for pipeline")
+    role_resp = Role.new()
+                    .name(role_name)
+                    .assume_role_policy_document({
+                                                     "Version":   "2012-10-17",
+                                                     "Statement": [
+                                                                      {
+                                                                          "Sid":       "",
+                                                                          "Effect":    "Allow",
+                                                                          "Principal": {
+                                                                              "Service": "codepipeline.amazonaws.com"
+                                                                          },
+                                                                          "Action":    "sts:AssumeRole"
+                                                                      }
+                                                                  ]
+                                                 }).create
+    Log.info("attaching policy #{@repo_name}PipelinePolicy to role #{role_name} for pipeline")
+    Role.attach_policy(policy_resp.policy.arn, role_name)
+    return role_resp.role.arn
+  end
+
+  def pipeline_role_policies
+    [
+        # 1) "s3:PutObject"
+        "s3:PutObject",
+        # 2) Code Deploy:
+        "codedeploy:CreateDeployment",
+        "codedeploy:GetApplicationRevision",
+        "codedeploy:GetDeployment",
+        "codedeploy:GetDeploymentConfig",
+        "codedeploy:RegisterApplicationRevision",
+        # 3) Cloud Formation:
+        "cloudformation:CreateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:UpdateStack",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:SetStackPolicy",
+        "cloudformation:ValidateTemplate",
+        # 4) Code Build:
+        "codebuild:BatchGetBuilds",
+        "codebuild:StartBuild",
+        # 5) SNS:
+        "sns:Publish"
+    ]
+  end
+
+  def pipeline_s3_location
+    bucket_name = "#{@repo_name.downcase}-pipeline-bucket-#{@pipeline_id}"
+    Log.info("creating #{bucket_name}")
+    s3 = Aws::S3::Client.new()
+    s3.create_bucket({
+                         :bucket => bucket_name,
+                     })
+    return bucket_name
+  end
+end
+init_logger
+pipeline = CreatePipeline.new("pipeline.yaml")
+pipeline.create

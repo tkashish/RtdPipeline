@@ -1,0 +1,331 @@
+#!/usr/bin/env ruby
+require_relative '../aws-ops/lib/codepipeline'
+require_relative '../aws-ops/lib/iam'
+require_relative '../aws-ops/lib/log.rb'
+require_relative '../aws-ops/lib/lambda.rb'
+require_relative '../aws-ops/lib/secret_manager.rb'
+require 'logger'
+require 'json'
+require 'yaml'
+
+def init_logger
+  l          = Logger.new(STDOUT)
+  l.level    = Logger::INFO
+  Log.logger = l
+end
+
+class CreatePipeline
+  attr_accessor :repo_name, :pipeline_id, :owners
+
+  def initialize(pipeline_yaml)
+    read_pipeline_info(pipeline_yaml)
+  end
+
+  def read_pipeline_info(pipeline_yaml)
+    Log.info("reading pipeline info")
+    info         = YAML.load_file(pipeline_yaml)
+    @repo_name   = info["Name"]
+    @pipeline_id = info["Id"]
+    @owners      ||= info["Owners"]
+  end
+
+  def create
+    pipeline = PipelineBuilder.build do |builder|
+      builder.name("#{@repo_name}Pipeline")
+          .role("#{pipeline_iam_role_arn}")
+          .artifact_store("#{pipeline_s3_location}")
+          .stage(source)
+          .stage(build)
+          .stage(validation)
+          .stage(approval)
+          .stage(deploy)
+    end
+    Log.info("creating #{@repo_name}Pipeline")
+    pipeline.create
+    # puts JSON.pretty_generate(pipeline.config)
+  end
+
+  def source
+    sourceAction = Action.new()
+                       .name("Source")
+                       .action_type(ActionTypeId.Source)
+                       .run_order(1)
+                       .output_artifact("SourceArtifact")
+                       .add_configuration("Owner", "tkashish")
+                       .add_configuration("Repo", "#{@repo_name}")
+                       .add_configuration("Branch", "master")
+                       .add_configuration("OAuthToken", "#{git_token}")
+    Stage.new("Source").action(sourceAction)
+  end
+
+  def build
+    buildAction = Action.new()
+                      .name("Build")
+                      .action_type(ActionTypeId.Build)
+                      .run_order(1)
+                      .input_artifact("SourceArtifact")
+                      .output_artifact("BuildArtifact")
+                      .add_configuration("ProjectName", "#{build_project_name}")
+    Stage.new("Build").action(buildAction)
+  end
+
+  def approval
+    approvalActionTypeId = ActionTypeId.new()
+                               .category("Approval")
+                               .owner("AWS")
+                               .version("1")
+                               .provider("Manual")
+    approvalAction       = Action.new()
+                               .name("ManualApproval")
+                               .action_type(approvalActionTypeId.params)
+                               .run_order(1)
+                               .add_configuration("NotificationArn", "#{create_pipeline_sns_topic}")
+    Stage.new("Approval").action(approvalAction)
+  end
+
+  def validation
+    create_validation_lambda
+    validationActionTypeId = ActionTypeId.new()
+                                 .category("Invoke")
+                                 .owner("AWS")
+                                 .version("1")
+                                 .provider("Lambda")
+    validationAction       = Action.new()
+                                 .name("ValidateCfTemplate")
+                                 .action_type(validationActionTypeId.params)
+                                 .run_order(1)
+                                 .add_configuration("FunctionName", "CfTemplateValidationLambda")
+                                 .input_artifact("BuildArtifact")
+    Stage.new("Validate").action(validationAction)
+  end
+
+  def deploy
+    deployAction = Action.new()
+                       .name("DeployCfTemplate")
+                       .action_type(ActionTypeId.DeployCf)
+                       .run_order(1)
+                       .input_artifact("BuildArtifact")
+                       .add_configuration("ActionMode", "CREATE_UPDATE")
+                       .add_configuration("StackName", @repo_name)
+                       .add_configuration("TemplatePath", "BuildArtifact::merged.yml")
+                       .add_configuration("OutputFileName", "output.json")
+                       .add_configuration("RoleArn", deploy_iam_role)
+    Stage.new("Deploy").action(deployAction)
+  end
+
+  def deploy_iam_role
+    principle = "CfTemplateDeploy"
+    Log.info("creating iam policy #{principle}Policy to deploy CF template")
+    statement   = PolicyStatement.new()
+                      .effect("Allow")
+                      .action("*")
+                      .resource("*")
+    policy_resp = Policy.new()
+                      .name("#{principle}Policy")
+                      .statement(statement)
+                      .create
+    role_name   = "#{principle}Role"
+    Log.info("creating iam role #{role_name} for pipeline")
+    role_resp = Role.new()
+                    .name(role_name)
+                    .assume_role_policy_document({
+                                                     "Version":   "2012-10-17",
+                                                     "Statement": [
+                                                                      {
+                                                                          "Sid":       "",
+                                                                          "Effect":    "Allow",
+                                                                          "Principal": {
+                                                                              "Service": ["codepipeline.amazonaws.com", "cloudformation.amazonaws.com"]
+                                                                          },
+                                                                          "Action":    "sts:AssumeRole"
+                                                                      }
+                                                                  ]
+                                                 }).create
+    Log.info("attaching policy #{principle}Policy to role #{role_name} for validation lambda")
+    Role.attach_policy(policy_resp, role_name)
+    return role_resp
+  end
+
+  def create_validation_lambda
+    Log.info("creating cf template validation lambda")
+    Lambda.new()
+        .runtime(LamdaRuntime::GO)
+        .function_name("CfTemplateValidationLambda")
+        .code(lambda_validation_code)
+        .handler("validate")
+        .role(create_validation_lambda_role)
+        .create
+  end
+
+  def lambda_validation_code
+    File.open('build/handler.zip', 'rb').read
+  end
+
+  def create_validation_lambda_role
+    principle = "CfTemplateValidationLambda"
+    Log.info("creating iam policy #{principle}Policy for validation lambda")
+    statement   = PolicyStatement.new()
+                      .effect("Allow")
+                      .action(validaiton_lambda_policies)
+                      .resource("*")
+    policy_resp = Policy.new()
+                      .name("#{principle}Policy")
+                      .statement(statement)
+                      .create
+    role_name   = "#{principle}Role"
+    Log.info("creating iam role #{role_name} for pipeline")
+    role_resp = Role.new()
+                    .name(role_name)
+                    .assume_role_policy_document({
+                                                     "Version":   "2012-10-17",
+                                                     "Statement": [
+                                                                      {
+                                                                          "Sid":       "",
+                                                                          "Effect":    "Allow",
+                                                                          "Principal": {
+                                                                              "Service": "lambda.amazonaws.com"
+                                                                          },
+                                                                          "Action":    "sts:AssumeRole"
+                                                                      }
+                                                                  ]
+                                                 }).create
+    Log.info("attaching policy #{principle}Policy to role #{role_name} for validation lambda")
+    Role.attach_policy(policy_resp, role_name)
+    return role_resp
+  end
+
+  def validaiton_lambda_policies
+    [
+        # 1) Code Pipeline
+        "codepipeline:PutJobFailureResult",
+        "codepipeline:PutJobSuccessResult",
+        # 2) Cloud Formation
+        "cloudformation:ValidateTemplate",
+        # 3) CloudWatch Logs
+        "logs:*"
+    ]
+  end
+
+  def create_pipeline_sns_topic
+    Log.info("creating sns topic for #{@repo_name}Pipeline")
+    sns = Aws::SNS::Client.new()
+    sns.list_topics.topics.each do |t|
+      return t.topic_arn if t.topic_arn.include?("#{@repo_name}PipelineSnsTopic")
+    end
+    resp = sns.create_topic({
+                                name: "#{@repo_name}PipelineSnsTopic", # required
+                            })
+    @owners.each do |owner|
+      Log.info("adding subscriber #{owner}")
+      sns.subscribe({
+                        topic_arn:               resp.topic_arn,
+                        protocol:                "email",
+                        endpoint:                "#{owner}",
+                        return_subscription_arn: false,
+                    })
+    end
+    Log.info("Check your email and please confirm the subscription.".green)
+    return resp.topic_arn
+  end
+
+  def git_token
+    tokenJson = SecretManager.secret("GitTokenCodePipeline")
+    JSON.parse(tokenJson)["gittoken"]
+  end
+
+  def build_project_name
+    "test-cf-build"
+  end
+
+  def pipeline_iam_role_arn
+    principle = "DeployCfTemplatePipeline"
+    Log.info("creating iam policy #{principle}Policy for pipeline")
+    statement   = PolicyStatement.new()
+                      .effect("Allow")
+                      .action(pipeline_role_policies)
+                      .resource("*")
+    policy_resp = Policy.new()
+                      .name("#{principle}Policy")
+                      .statement(statement)
+                      .create
+    role_name   = "#{principle}Role"
+    Log.info("creating iam role #{role_name} for pipeline")
+    role_resp = Role.new()
+                    .name(role_name)
+                    .assume_role_policy_document({
+                                                     "Version":   "2012-10-17",
+                                                     "Statement": [
+                                                                      {
+                                                                          "Sid":       "",
+                                                                          "Effect":    "Allow",
+                                                                          "Principal": {
+                                                                              "Service": ["codepipeline.amazonaws.com", "cloudformation.amazonaws.com"]
+                                                                          },
+                                                                          "Action":    "sts:AssumeRole"
+                                                                      }
+                                                                  ]
+                                                 }).create
+    Log.info("attaching policy #{principle}Policy to role #{role_name} for pipeline")
+    Role.attach_policy(policy_resp, role_name)
+    return role_resp
+  end
+
+  def pipeline_role_policies
+    [
+        # 1) "s3:PutObject"
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:GetBucketVersioning",
+        # 2) Code Deploy:
+        "codedeploy:CreateDeployment",
+        "codedeploy:GetApplicationRevision",
+        "codedeploy:GetDeployment",
+        "codedeploy:GetDeploymentConfig",
+        "codedeploy:RegisterApplicationRevision",
+        # 3) Cloud Formation:
+        "cloudformation:CreateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:UpdateStack",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:SetStackPolicy",
+        "cloudformation:ValidateTemplate",
+        # 4) Code Build:
+        "codebuild:BatchGetBuilds",
+        "codebuild:StartBuild",
+        # 5) SNS:
+        "sns:Publish",
+        # 6) Lambda:
+        "lambda:ListFunctions",
+        "lambda:InvokeFunction",
+        # 7) IAM:
+        "iam:PassRole"
+    ]
+  end
+
+  def pipeline_s3_location
+    bucket_name = "#{@repo_name.downcase}-pipeline-#{@pipeline_id}"
+    Log.info("creating #{bucket_name}")
+    s3     = Aws::S3::Client.new()
+    exists = false
+    s3.list_buckets.buckets.each do |bucket|
+      if bucket_name.eql?(bucket.name)
+        exists = true
+        break
+      end
+    end
+    if !exists
+      s3.create_bucket({
+                           :bucket => bucket_name,
+                       })
+    end
+    return bucket_name
+  end
+end
+init_logger
+pipeline = CreatePipeline.new("pipeline.yaml")
+pipeline.create
